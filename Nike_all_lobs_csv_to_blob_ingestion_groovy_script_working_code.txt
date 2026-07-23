@@ -1,0 +1,1673 @@
+import groovy.json.JsonOutput
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.sql.*
+import java.util.Locale
+import java.util.regex.Pattern
+
+/*
+NIKE FORECAST + BOM USAGE CSV -> ADW BLOB LOADER
+
+This Groovy procedure capabilities
+--------------------------------------
+1. Read all active NIKE_FORECAST configuration rows.
+2. Process LOBs in PROCESSING_ORDER.
+3. For each LOB, process zero, one or many CSVs sequentially.
+4. Read source_file_name and file_creation_date from the converted CSV.
+5. Use SHA-256 to skip an already-successful identical CSV.
+6. Insert and update one file-audit row for every discovered CSV.
+7. Load every nonblank row into the configured ADW BLOB table.
+8. Route BOM Usage configurations to DM_STG_BOM_USAGE.
+9. Delay CSV/original cleanup until every required Forecast and BOM Usage
+   configuration for the same original source has succeeded.
+10. Attempt all files and fail ODI at the end if any load/cleanup failed.
+
+===============================================================================
+*/
+
+// -----------------------------------------------------------------------------
+// FIXED CONTROL OBJECTS
+// -----------------------------------------------------------------------------
+String configTable       = "CUSTFCST_STG_ADW.DM_INGESTION_CONFIG"
+String runAuditTable     = "CUSTFCST_STG_ADW.DM_INGESTION_RUN_AUDIT"
+String fileAuditTable    = "CUSTFCST_STG_ADW.DM_INGESTION_FILE_AUDIT"
+String fileAuditSequence = "CUSTFCST_STG_ADW.SEQ_INGESTION_FILE_AUDIT"
+
+String pipelineCode = "NIKE_FORECAST"
+String runIdText = null
+
+try {
+    String optionValue = odiRef.getOption("P_PIPELINE_CODE")
+    if (optionValue != null && optionValue.trim().length() > 0) {
+        pipelineCode = optionValue.trim().toUpperCase(Locale.ENGLISH)
+    }
+} catch (Throwable ignored) {
+    println "P_PIPELINE_CODE not supplied; using NIKE_FORECAST"
+}
+
+/*
+try {
+    runIdText = odiRef.getOption("P_RUN_ID")
+} catch (Throwable ignored) {}
+
+if (runIdText == null || runIdText.trim().length() == 0) {
+    throw new RuntimeException(
+        "P_RUN_ID is mandatory. Refresh the ODI RUN_ID variable before " +
+        "executing this procedure."
+    )
+} ---commented by Rajan - 15-07-2026 as refresh variable of P run id is not working when setting up under options tab*/ 
+
+// Read the value directly from the ODI variable refreshed in the package.
+runIdText = "#PROJECT_CONCH.V_NIKE_RUN_ID"
+
+println "Resolved Nike RUN_ID from ODI variable: " + runIdText
+
+if (
+    runIdText == null ||
+    runIdText.trim().length() == 0 ||
+    runIdText.trim().startsWith("#")
+) {
+    throw new RuntimeException(
+        "V_NIKE_RUN_ID was not resolved. Confirm that the variable refresh " +
+        "step completed successfully before the Groovy loader."
+    )
+}
+
+long runId
+try {
+    runId = Long.parseLong(runIdText.trim())
+} catch (Exception e) {
+    throw new RuntimeException("Invalid P_RUN_ID: " + runIdText, e)
+}
+
+class CsvLoadException extends RuntimeException {
+    long rowsRead
+    long rowsAttempted
+
+    CsvLoadException(
+        String message,
+        Throwable cause,
+        long rowsRead,
+        long rowsAttempted
+    ) {
+        super(message, cause)
+        this.rowsRead = rowsRead
+        this.rowsAttempted = rowsAttempted
+    }
+}
+
+// -----------------------------------------------------------------------------
+// GENERAL HELPERS
+// -----------------------------------------------------------------------------
+List<String> parseCsvLine(String line, char delimiter) {
+    List<String> output = []
+    StringBuilder current = new StringBuilder()
+    boolean inQuotes = false
+
+    for (int i = 0; i < line.length(); i++) {
+        char c = line.charAt(i)
+
+        if (c == '"') {
+            if (inQuotes &&
+                i + 1 < line.length() &&
+                line.charAt(i + 1) == '"') {
+                current.append('"')
+                i++
+            } else {
+                inQuotes = !inQuotes
+            }
+        } else if (c == delimiter && !inQuotes) {
+            output << current.toString()
+            current.setLength(0)
+        } else {
+            current.append(c)
+        }
+    }
+
+    output << current.toString()
+    return output
+}
+
+List<String> normalizeDuplicateHeaders(List<String> headers) {
+    Map<String, Integer> counts = [:]
+    List<String> normalized = []
+
+    headers.eachWithIndex { String rawHeader, int index ->
+        String header = rawHeader?.trim()
+
+        if (header == null || header.length() == 0) {
+            header = "COL_${index + 1}"
+        }
+
+        String lookupKey = header.toUpperCase(Locale.ENGLISH)
+        int occurrence = (counts[lookupKey] ?: 0) + 1
+        counts[lookupKey] = occurrence
+
+        normalized << (
+            occurrence == 1
+                ? header
+                : "${header}_${occurrence}"
+        )
+    }
+
+    return normalized
+}
+
+String validateObjectPart(String value) {
+    if (value == null || !(value ==~ /[A-Za-z][A-Za-z0-9_$#]*/)) {
+        throw new RuntimeException("Invalid database object name: " + value)
+    }
+
+    return value.toUpperCase(Locale.ENGLISH)
+}
+
+String buildQualifiedObject(String schemaName, String objectName) {
+    return validateObjectPart(schemaName) + "." +
+        validateObjectPart(objectName)
+}
+
+long getNextValue(Connection conn, String sequenceName) {
+    String[] parts = sequenceName.split(/\./)
+
+    if (parts.length != 2) {
+        throw new RuntimeException(
+            "Sequence must be schema-qualified: " + sequenceName
+        )
+    }
+
+    String safeSequence = buildQualifiedObject(parts[0], parts[1])
+    Statement statement = conn.createStatement()
+    ResultSet resultSet = null
+
+    try {
+        resultSet = statement.executeQuery(
+            "SELECT ${safeSequence}.NEXTVAL FROM DUAL"
+        )
+        resultSet.next()
+        return resultSet.getLong(1)
+    } finally {
+        if (resultSet != null) {
+            try { resultSet.close() } catch (Exception ignored) {}
+        }
+        try { statement.close() } catch (Exception ignored) {}
+    }
+}
+
+Timestamp getDatabaseTimestamp(Connection conn) {
+    Statement statement = conn.createStatement()
+    ResultSet resultSet = null
+
+    try {
+        resultSet = statement.executeQuery(
+            "SELECT CAST(SYSTIMESTAMP AS TIMESTAMP) FROM DUAL"
+        )
+        resultSet.next()
+        return resultSet.getTimestamp(1)
+    } finally {
+        if (resultSet != null) {
+            try { resultSet.close() } catch (Exception ignored) {}
+        }
+        try { statement.close() } catch (Exception ignored) {}
+    }
+}
+
+String calculateSha256(File file) {
+    MessageDigest digest = MessageDigest.getInstance("SHA-256")
+
+    file.withInputStream { input ->
+        byte[] buffer = new byte[1024 * 1024]
+        int bytesRead
+
+        while ((bytesRead = input.read(buffer)) != -1) {
+            digest.update(buffer, 0, bytesRead)
+        }
+    }
+
+    return digest.digest()
+        .collect { String.format("%02x", it & 0xff) }
+        .join()
+}
+
+boolean isYes(Object value) {
+    return value != null &&
+        value.toString().trim().equalsIgnoreCase("Y")
+}
+
+java.sql.Date parseSqlDate(String value) {
+    if (value == null || value.trim().length() == 0) {
+        return null
+    }
+
+    List<String> patterns = [
+        "yyyy-MM-dd",
+        "yyyy-MM-dd HH:mm:ss",
+        "dd-MMM-yyyy",
+        "dd-MMM-yy"
+    ]
+
+    for (String pattern : patterns) {
+        try {
+            java.text.SimpleDateFormat formatter =
+                new java.text.SimpleDateFormat(pattern, Locale.ENGLISH)
+            formatter.setLenient(false)
+
+            return new java.sql.Date(
+                formatter.parse(value.trim()).getTime()
+            )
+        } catch (Exception ignored) {}
+    }
+
+    return null
+}
+
+Map inspectCsv(
+    File csvFile,
+    String encoding,
+    char delimiter,
+    String sourceFileColumn,
+    String fileDateColumn
+) {
+    Map metadata = [
+        sourceFileName  : null,
+        fileCreationDate: null
+    ]
+
+    csvFile.withReader(encoding) { reader ->
+        String headerLine = reader.readLine()
+
+        if (headerLine == null) {
+            throw new RuntimeException(
+                "CSV is empty: ${csvFile.absolutePath}"
+            )
+        }
+
+        headerLine = headerLine
+            .replace("\uFEFF", "")
+            .replaceAll(/\r$/, "")
+
+        List<String> headers = normalizeDuplicateHeaders(
+            parseCsvLine(headerLine, delimiter)
+        )
+
+        int sourceIndex = headers.findIndexOf {
+            it.equalsIgnoreCase(sourceFileColumn)
+        }
+
+        int dateIndex = headers.findIndexOf {
+            it.equalsIgnoreCase(fileDateColumn)
+        }
+
+        if (sourceIndex < 0) {
+            throw new RuntimeException(
+                "Required column '${sourceFileColumn}' is missing from " +
+                csvFile.absolutePath
+            )
+        }
+
+        if (dateIndex < 0) {
+            throw new RuntimeException(
+                "Required column '${fileDateColumn}' is missing from " +
+                csvFile.absolutePath
+            )
+        }
+
+        String line
+        while ((line = reader.readLine()) != null) {
+            line = line.replaceAll(/\r$/, "")
+
+            if (line.trim().length() == 0) {
+                continue
+            }
+
+            List<String> values = parseCsvLine(line, delimiter)
+
+            if (values.size() < headers.size()) {
+                while (values.size() < headers.size()) {
+                    values << null
+                }
+            }
+
+            metadata.sourceFileName =
+                sourceIndex < values.size()
+                    ? values[sourceIndex]?.trim()
+                    : null
+
+            String dateValue =
+                dateIndex < values.size()
+                    ? values[dateIndex]?.trim()
+                    : null
+
+            metadata.fileCreationDate = parseSqlDate(dateValue)
+            break
+        }
+    }
+
+    if (metadata.sourceFileName == null ||
+        metadata.sourceFileName.length() == 0) {
+        throw new RuntimeException(
+            "source_file_name is blank in ${csvFile.absolutePath}"
+        )
+    }
+
+    if (metadata.fileCreationDate == null) {
+        throw new RuntimeException(
+            "file_creation_date is blank or invalid in " +
+            csvFile.absolutePath
+        )
+    }
+
+    return metadata
+}
+
+String originalContainerName(String sourceFileName) {
+    if (sourceFileName == null) {
+        return null
+    }
+
+    String normalized = sourceFileName.replace("\\", "/").trim()
+    int slashIndex = normalized.indexOf("/")
+
+    return slashIndex >= 0
+        ? normalized.substring(0, slashIndex)
+        : normalized
+}
+
+File findOriginalSourceFile(
+    String sourceFolder,
+    String sourceFileName
+) {
+    if (sourceFolder == null || sourceFolder.trim().length() == 0) {
+        return null
+    }
+
+    File folder = new File(sourceFolder)
+    if (!folder.exists() || !folder.isDirectory()) {
+        return null
+    }
+
+    String expectedName = originalContainerName(sourceFileName)
+    if (expectedName == null) {
+        return null
+    }
+
+    List<String> candidates = [expectedName]
+
+    if (expectedName.toLowerCase(Locale.ENGLISH).endsWith(".zip.zip")) {
+        candidates << expectedName.substring(
+            0,
+            expectedName.length() - 4
+        )
+    }
+
+    File[] files = folder.listFiles()
+    if (files == null) {
+        return null
+    }
+
+    for (File file : files) {
+        if (!file.isFile()) {
+            continue
+        }
+
+        if (candidates.any { String candidate ->
+            file.name.equalsIgnoreCase(candidate)
+        }) {
+            return file
+        }
+    }
+
+    return null
+}
+
+// -----------------------------------------------------------------------------
+// DATABASE HELPERS
+// -----------------------------------------------------------------------------
+void validateStartedRun(
+    Connection conn,
+    String tableName,
+    long requestedRunId,
+    String requestedPipeline
+) {
+    String sql = """
+        SELECT COUNT(*)
+        FROM ${tableName}
+        WHERE RUN_ID = ?
+          AND PIPELINE_CODE = ?
+          AND RUN_STATUS = 'STARTED'
+    """
+
+    PreparedStatement statement = conn.prepareStatement(sql)
+    ResultSet resultSet = null
+
+    try {
+        statement.setLong(1, requestedRunId)
+        statement.setString(2, requestedPipeline)
+        resultSet = statement.executeQuery()
+        resultSet.next()
+
+        if (resultSet.getLong(1) != 1) {
+            throw new RuntimeException(
+                "No STARTED run-audit row found for RUN_ID=" +
+                requestedRunId + " and PIPELINE_CODE=" + requestedPipeline
+            )
+        }
+    } finally {
+        if (resultSet != null) {
+            try { resultSet.close() } catch (Exception ignored) {}
+        }
+        statement.close()
+    }
+}
+
+List<Map> readConfigurations(
+    Connection conn,
+    String tableName,
+    String requestedPipeline
+) {
+    String sql = """
+        SELECT
+            CONFIG_ID,
+            PIPELINE_CODE,
+            BRAND_NAME,
+            LOB,
+            FILE_TYPE,
+            PROCESSING_ORDER,
+            CSV_FOLDER,
+            ORIGINAL_SOURCE_FOLDER,
+            CSV_FILE_REGEX,
+            TARGET_SCHEMA,
+            TARGET_TABLE,
+            FILE_ENCODING,
+            FILE_DELIMITER,
+            SOURCE_FILE_COLUMN,
+            FILE_DATE_COLUMN,
+            BATCH_SIZE,
+            MIN_FILE_AGE_MINUTES,
+            DELETE_CSV_ON_SUCCESS,
+            DELETE_ORIGINAL_ON_SUCCESS,
+            EXPECTED_FREQUENCY
+        FROM ${tableName}
+        WHERE PIPELINE_CODE = ?
+          AND ACTIVE_FLAG = 'Y'
+        ORDER BY PROCESSING_ORDER, CONFIG_ID
+    """
+
+    PreparedStatement statement = conn.prepareStatement(sql)
+    ResultSet resultSet = null
+    List<Map> configurations = []
+
+    try {
+        statement.setString(1, requestedPipeline)
+        resultSet = statement.executeQuery()
+
+        while (resultSet.next()) {
+            configurations << [
+                CONFIG_ID                 : resultSet.getLong("CONFIG_ID"),
+                PIPELINE_CODE             : resultSet.getString("PIPELINE_CODE"),
+                BRAND_NAME                : resultSet.getString("BRAND_NAME"),
+                LOB                       : resultSet.getString("LOB"),
+                // Protect the target/audit values from legacy BOM_USAGE
+                // configuration spelling. The business value is "BOM Usage".
+                FILE_TYPE                 : canonicalFileType(
+                    resultSet.getString("FILE_TYPE")
+                ),
+                PROCESSING_ORDER          : resultSet.getInt("PROCESSING_ORDER"),
+                CSV_FOLDER                : resultSet.getString("CSV_FOLDER"),
+                ORIGINAL_SOURCE_FOLDER    : resultSet.getString("ORIGINAL_SOURCE_FOLDER"),
+                CSV_FILE_REGEX            : resultSet.getString("CSV_FILE_REGEX"),
+                TARGET_SCHEMA             : resultSet.getString("TARGET_SCHEMA"),
+                TARGET_TABLE              : resultSet.getString("TARGET_TABLE"),
+                FILE_ENCODING             : resultSet.getString("FILE_ENCODING"),
+                FILE_DELIMITER            : resultSet.getString("FILE_DELIMITER"),
+                SOURCE_FILE_COLUMN        : resultSet.getString("SOURCE_FILE_COLUMN"),
+                FILE_DATE_COLUMN          : resultSet.getString("FILE_DATE_COLUMN"),
+                BATCH_SIZE                : resultSet.getInt("BATCH_SIZE"),
+                MIN_FILE_AGE_MINUTES      : resultSet.getInt("MIN_FILE_AGE_MINUTES"),
+                DELETE_CSV_ON_SUCCESS     : resultSet.getString("DELETE_CSV_ON_SUCCESS"),
+                DELETE_ORIGINAL_ON_SUCCESS: resultSet.getString("DELETE_ORIGINAL_ON_SUCCESS"),
+                EXPECTED_FREQUENCY        : resultSet.getString("EXPECTED_FREQUENCY")
+            ]
+        }
+    } finally {
+        if (resultSet != null) {
+            try { resultSet.close() } catch (Exception ignored) {}
+        }
+        statement.close()
+    }
+
+    return configurations
+}
+
+boolean alreadyLoaded(
+    Connection conn,
+    String tableName,
+    long configId,
+    String fileHash,
+    String sourceFileName,
+    java.sql.Date fileCreationDate
+) {
+    String sql = """
+        SELECT COUNT(*)
+        FROM ${tableName}
+        WHERE CONFIG_ID = ?
+          AND LOAD_STATUS = 'SUCCESS'
+          AND
+          (
+              FILE_SHA256 = ?
+              OR
+              (
+                  SOURCE_FILE_NAME = ?
+                  AND FILE_CREATION_DATE = ?
+              )
+          )
+    """
+
+    PreparedStatement statement = conn.prepareStatement(sql)
+    ResultSet resultSet = null
+
+    try {
+        statement.setLong(1, configId)
+        statement.setString(2, fileHash)
+        statement.setString(3, sourceFileName)
+        statement.setDate(4, fileCreationDate)
+        resultSet = statement.executeQuery()
+        resultSet.next()
+        return resultSet.getLong(1) > 0
+    } finally {
+        if (resultSet != null) {
+            try { resultSet.close() } catch (Exception ignored) {}
+        }
+        statement.close()
+    }
+}
+
+long insertFileAudit(
+    Connection conn,
+    String tableName,
+    String sequenceName,
+    long requestedRunId,
+    Map config,
+    File csvFile,
+    String sourceFileName,
+    java.sql.Date fileCreationDate,
+    String fileHash,
+    String status,
+    String errorMessage
+) {
+    long fileAuditId = getNextValue(conn, sequenceName)
+
+    String sql = """
+        INSERT INTO ${tableName}
+        (
+            FILE_AUDIT_ID,
+            RUN_ID,
+            CONFIG_ID,
+            PIPELINE_CODE,
+            BRAND_NAME,
+            LOB,
+            FILE_TYPE,
+            CSV_FILE_NAME,
+            CSV_FILE_PATH,
+            SOURCE_FILE_NAME,
+            ORIGINAL_SOURCE_FOLDER,
+            FILE_SIZE_BYTES,
+            FILE_LAST_MODIFIED_DT,
+            FILE_CREATION_DATE,
+            FILE_SHA256,
+            TARGET_SCHEMA,
+            TARGET_TABLE,
+            LOAD_START_DT,
+            LOAD_STATUS,
+            ROWS_READ,
+            ROWS_LOADED,
+            ERROR_MESSAGE,
+            CREATED_DT,
+            UPDATED_DT
+        )
+        VALUES
+        (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            SYSTIMESTAMP, ?, 0, 0, ?, SYSTIMESTAMP, SYSTIMESTAMP
+        )
+    """
+
+    PreparedStatement statement = conn.prepareStatement(sql)
+
+    try {
+        statement.setLong(1, fileAuditId)
+        statement.setLong(2, requestedRunId)
+        statement.setLong(3, config.CONFIG_ID as long)
+        statement.setString(4, config.PIPELINE_CODE)
+        statement.setString(5, config.BRAND_NAME)
+        statement.setString(6, config.LOB)
+        statement.setString(7, config.FILE_TYPE)
+        statement.setString(8, csvFile?.name)
+        statement.setString(9, csvFile?.absolutePath)
+        statement.setString(10, sourceFileName)
+        statement.setString(11, config.ORIGINAL_SOURCE_FOLDER)
+
+        if (csvFile == null) {
+            statement.setNull(12, Types.NUMERIC)
+            statement.setNull(13, Types.TIMESTAMP)
+        } else {
+            statement.setLong(12, csvFile.length())
+            statement.setTimestamp(
+                13,
+                new Timestamp(csvFile.lastModified())
+            )
+        }
+
+        if (fileCreationDate == null) {
+            statement.setNull(14, Types.DATE)
+        } else {
+            statement.setDate(14, fileCreationDate)
+        }
+
+        statement.setString(15, fileHash)
+        statement.setString(16, config.TARGET_SCHEMA)
+        statement.setString(17, config.TARGET_TABLE)
+        statement.setString(18, status)
+        statement.setString(19, errorMessage?.take(4000))
+        statement.executeUpdate()
+    } finally {
+        statement.close()
+    }
+
+    return fileAuditId
+}
+
+void markFileSuccess(
+    Connection conn,
+    String tableName,
+    long fileAuditId,
+    long rowsRead,
+    long rowsLoaded
+) {
+    String sql = """
+        UPDATE ${tableName}
+        SET LOAD_END_DT = SYSTIMESTAMP,
+            LOAD_STATUS = 'SUCCESS',
+            ROWS_READ = ?,
+            ROWS_LOADED = ?,
+            ERROR_MESSAGE = NULL,
+            UPDATED_DT = SYSTIMESTAMP
+        WHERE FILE_AUDIT_ID = ?
+    """
+
+    PreparedStatement statement = conn.prepareStatement(sql)
+    try {
+        statement.setLong(1, rowsRead)
+        statement.setLong(2, rowsLoaded)
+        statement.setLong(3, fileAuditId)
+        statement.executeUpdate()
+    } finally {
+        statement.close()
+    }
+}
+
+void markFileFailed(
+    Connection conn,
+    String tableName,
+    long fileAuditId,
+    long rowsRead,
+    String errorMessage
+) {
+    String sql = """
+        UPDATE ${tableName}
+        SET LOAD_END_DT = SYSTIMESTAMP,
+            LOAD_STATUS = 'FAILED',
+            ROWS_READ = ?,
+            ROWS_LOADED = 0,
+            ERROR_MESSAGE = ?,
+            UPDATED_DT = SYSTIMESTAMP
+        WHERE FILE_AUDIT_ID = ?
+    """
+
+    PreparedStatement statement = conn.prepareStatement(sql)
+    try {
+        statement.setLong(1, rowsRead)
+        statement.setString(2, errorMessage?.take(4000))
+        statement.setLong(3, fileAuditId)
+        statement.executeUpdate()
+    } finally {
+        statement.close()
+    }
+}
+
+void updateCleanupStatus(
+    Connection conn,
+    String tableName,
+    List<Long> fileAuditIds,
+    String csvDeleteStatus,
+    String originalDeleteStatus,
+    String cleanupMessage
+) {
+    if (fileAuditIds == null || fileAuditIds.isEmpty()) {
+        return
+    }
+
+    String sql = """
+        UPDATE ${tableName}
+        SET CSV_DELETE_STATUS = COALESCE(?, CSV_DELETE_STATUS),
+            ORIGINAL_DELETE_STATUS = COALESCE(?, ORIGINAL_DELETE_STATUS),
+            CLEANUP_MESSAGE = ?,
+            UPDATED_DT = SYSTIMESTAMP
+        WHERE FILE_AUDIT_ID = ?
+    """
+
+    PreparedStatement statement = conn.prepareStatement(sql)
+
+    try {
+        fileAuditIds.each { Long fileAuditId ->
+            statement.setString(1, csvDeleteStatus)
+            statement.setString(2, originalDeleteStatus)
+            statement.setString(3, cleanupMessage?.take(4000))
+            statement.setLong(4, fileAuditId)
+            statement.addBatch()
+        }
+
+        statement.executeBatch()
+    } finally {
+        statement.close()
+    }
+}
+
+long deleteCurrentAttemptRows(
+    Connection conn,
+    String targetTable,
+    Map config,
+    String sourceFileName,
+    java.sql.Date fileCreationDate,
+    Timestamp attemptStartTimestamp
+) {
+    String sql = """
+        DELETE FROM ${targetTable}
+        WHERE BRAND_NAME = ?
+          AND LOB = ?
+          AND SOURCE_FILE_NAME = ?
+          AND FILE_CREATION_DATE = ?
+          AND DATA_INGESTION_DT >= ?
+    """
+
+    PreparedStatement statement = conn.prepareStatement(sql)
+    try {
+        statement.setString(1, config.BRAND_NAME)
+        statement.setString(2, config.LOB)
+        statement.setString(3, sourceFileName)
+        statement.setDate(4, fileCreationDate)
+        statement.setTimestamp(5, attemptStartTimestamp)
+        return statement.executeUpdate()
+    } finally {
+        statement.close()
+    }
+}
+
+// -----------------------------------------------------------------------------
+// LOAD ONE CSV
+// -----------------------------------------------------------------------------
+Map loadOneCsv(
+    Connection conn,
+    String targetTable,
+    Map config,
+    File csvFile,
+    Map metadata
+) {
+    String encoding = config.FILE_ENCODING ?: "UTF-8"
+    String delimiterText = config.FILE_DELIMITER ?: ","
+    char delimiter = delimiterText.charAt(0)
+    int batchSize = (config.BATCH_SIZE as int) > 0
+        ? config.BATCH_SIZE as int
+        : 1000
+
+    String insertSql = """
+        INSERT INTO ${targetTable}
+        (
+            BRAND_NAME,
+            LOB,
+            FILE_TYPE,
+            SOURCE_FILE_NAME,
+            DATA_INGESTION_DT,
+            FILE_CONTENT_JSON,
+            SOURCE_COLUMN_LIST_JSON,
+            FILE_CREATION_DATE
+        )
+        VALUES
+        (
+            ?, ?, ?, ?, SYSTIMESTAMP, ?, ?, ?
+        )
+    """
+
+    PreparedStatement statement = conn.prepareStatement(insertSql)
+    long rowsRead = 0
+    long rowsAttempted = 0
+    long lineNumber = 0
+    long fileStartNanos = System.nanoTime()
+
+    try {
+        csvFile.withReader(encoding) { reader ->
+            String headerLine = reader.readLine()
+            lineNumber++
+
+            if (headerLine == null) {
+                throw new RuntimeException(
+                    "CSV is empty: ${csvFile.absolutePath}"
+                )
+            }
+
+            headerLine = headerLine
+                .replace("\uFEFF", "")
+                .replaceAll(/\r$/, "")
+
+            List<String> headers = normalizeDuplicateHeaders(
+                parseCsvLine(headerLine, delimiter)
+            )
+
+            int sourceIndex = headers.findIndexOf {
+                it.equalsIgnoreCase(config.SOURCE_FILE_COLUMN)
+            }
+
+            if (sourceIndex < 0) {
+                throw new RuntimeException(
+                    "Required source column '${config.SOURCE_FILE_COLUMN}' " +
+                    "is missing from ${csvFile.absolutePath}"
+                )
+            }
+
+            String headerJson = JsonOutput.toJson(headers)
+            byte[] headerBytes =
+                headerJson.getBytes(StandardCharsets.UTF_8)
+
+            String line
+            while ((line = reader.readLine()) != null) {
+                lineNumber++
+                line = line.replaceAll(/\r$/, "")
+
+                if (line.trim().length() == 0) {
+                    continue
+                }
+
+                rowsRead++
+
+                List<String> values = parseCsvLine(line, delimiter)
+
+                if (values.size() < headers.size()) {
+                    while (values.size() < headers.size()) {
+                        values << null
+                    }
+                } else if (values.size() > headers.size()) {
+                    values = values.subList(0, headers.size())
+                }
+
+                String rowSourceFileName = values[sourceIndex]?.trim()
+
+                if (rowSourceFileName == null ||
+                    !rowSourceFileName.equals(metadata.sourceFileName)) {
+                    throw new RuntimeException(
+                        "One converted CSV must contain one source_file_name. " +
+                        "Expected '${metadata.sourceFileName}' but found " +
+                        "'${rowSourceFileName}' at line ${lineNumber}."
+                    )
+                }
+
+                Map<String, Object> rowMap =
+                    new LinkedHashMap<String, Object>()
+
+                headers.eachWithIndex { String header, int index ->
+                    rowMap[header] = values[index]
+                }
+
+                byte[] rowBytes = JsonOutput
+                    .toJson(rowMap)
+                    .getBytes(StandardCharsets.UTF_8)
+
+                statement.setString(1, config.BRAND_NAME)
+                statement.setString(2, config.LOB)
+                statement.setString(3, config.FILE_TYPE)
+                statement.setString(4, metadata.sourceFileName)
+                statement.setBytes(5, rowBytes)
+                statement.setBytes(6, headerBytes)
+                statement.setDate(7, metadata.fileCreationDate)
+                statement.addBatch()
+                rowsAttempted++
+
+                if (rowsAttempted % batchSize == 0) {
+                    statement.executeBatch()
+                    statement.clearBatch()
+                    conn.commit()
+
+                    double elapsedSeconds =
+                        (System.nanoTime() - fileStartNanos) /
+                        1_000_000_000.0
+
+                    println String.format(
+                        Locale.ENGLISH,
+                        "  Progress: %,d rows | %.2f sec | %.2f rows/sec",
+                        rowsAttempted,
+                        elapsedSeconds,
+                        elapsedSeconds > 0
+                            ? rowsAttempted / elapsedSeconds
+                            : 0
+                    )
+                }
+            }
+        }
+
+        statement.executeBatch()
+        statement.clearBatch()
+        conn.commit()
+
+        double elapsedSeconds =
+            (System.nanoTime() - fileStartNanos) /
+            1_000_000_000.0
+
+        return [
+            rowsRead      : rowsRead,
+            rowsLoaded    : rowsAttempted,
+            elapsedSeconds: elapsedSeconds,
+            rowsPerSecond : elapsedSeconds > 0
+                ? rowsAttempted / elapsedSeconds
+                : 0
+        ]
+
+    } catch (Exception error) {
+        try { conn.rollback() } catch (Exception ignored) {}
+
+        throw new CsvLoadException(
+            "FAILED at CSV line ${lineNumber} for ${csvFile.name}: " +
+            error.message,
+            error,
+            rowsRead,
+            rowsAttempted
+        )
+
+    } finally {
+        try { statement.close() } catch (Exception ignored) {}
+    }
+}
+
+// -----------------------------------------------------------------------------
+// ODI-MANAGED CONNECTION
+// -----------------------------------------------------------------------------
+Connection conn = null
+
+try {
+    conn = odiRef.getJDBCConnection("DEST")
+} catch (Throwable ignored) {}
+
+if (conn == null) {
+    try {
+        conn = odiRef.getJDBCConnection("TARGET")
+    } catch (Throwable ignored) {}
+}
+
+if (conn == null) {
+    throw new RuntimeException(
+        "Could not obtain ODI target JDBC connection. " +
+        "Check the Procedure target logical schema."
+    )
+}
+
+boolean originalAutoCommit = conn.getAutoCommit()
+if (originalAutoCommit) {
+    conn.setAutoCommit(false)
+}
+
+int filesDiscovered = 0
+int filesLoaded = 0
+int filesSkipped = 0
+int filesFailed = 0
+int cleanupFailures = 0
+long totalRowsLoaded = 0
+List<String> errors = []
+boolean unmappedInspectionFailure = false
+
+// One original ZIP/workbook may generate Forecast and BOM Usage CSVs under
+// different configuration rows. They are grouped across CONFIG_ID values and
+// cleaned only after every required configuration has succeeded.
+Map<String, Map> originalGroups = [:]
+
+try {
+    println "==============================================================="
+    println "NIKE PRODUCTION BLOB INGESTION STARTED"
+    println "RUN_ID          : ${runId}"
+    println "PIPELINE_CODE   : ${pipelineCode}"
+    println "Connected user  : ${conn.metaData.userName}"
+    println "==============================================================="
+
+    validateStartedRun(
+        conn,
+        runAuditTable,
+        runId,
+        pipelineCode
+    )
+
+    List<Map> configurations = readConfigurations(
+        conn,
+        configTable,
+        pipelineCode
+    )
+
+    if (configurations.isEmpty()) {
+        throw new RuntimeException(
+            "No active configuration rows found for " + pipelineCode
+        )
+    }
+
+    // Enforce the BOM target explicitly so a configuration mistake cannot
+    // send BOM Usage rows to DM_STG_FORECAST_MASTER.
+    configurations.each { Map config ->
+        if (isBomUsageConfig(config) &&
+            !"DM_STG_BOM_USAGE".equalsIgnoreCase(
+                config.TARGET_TABLE?.toString()?.trim()
+            )) {
+            throw new RuntimeException(
+                "BOM Usage configuration CONFIG_ID=${config.CONFIG_ID} " +
+                "must target DM_STG_BOM_USAGE, but TARGET_TABLE=" +
+                config.TARGET_TABLE
+            )
+        }
+    }
+
+    Set<String> requiredBomLobs = [
+        "APPAREL", "FOOTWEAR", "LIONBROTHERS"
+    ] as Set<String>
+
+    Set<String> configuredBomLobs = configurations
+        .findAll { Map config -> isBomUsageConfig(config) }
+        .collect { Map config -> normalizedLobToken(config.LOB) }
+        .findAll { String lob -> lob.length() > 0 } as Set<String>
+
+    Set<String> missingBomLobs = new LinkedHashSet<String>(requiredBomLobs)
+    missingBomLobs.removeAll(configuredBomLobs)
+
+    if (!missingBomLobs.isEmpty()) {
+        throw new RuntimeException(
+            "Cleanup safety check failed. Active BOM Usage configurations " +
+            "are required for Apparel, Footwear and Lion Brothers before " +
+            "this loader can run. Missing LOBs: " + missingBomLobs.join(",")
+        )
+    }
+
+    // Every active config for the same Brand + LOB is required before the
+    // corresponding original source is eligible for cleanup.
+    Map<String, Set<Long>> requiredConfigIdsByLob = [:]
+    configurations.each { Map config ->
+        String lobKey = (
+            (config.BRAND_NAME ?: "").toString().trim().toUpperCase(Locale.ENGLISH)
+            + "|" +
+            (config.LOB ?: "").toString().trim().toUpperCase(Locale.ENGLISH)
+        )
+        if (!requiredConfigIdsByLob.containsKey(lobKey)) {
+            requiredConfigIdsByLob[lobKey] = new LinkedHashSet<Long>()
+        }
+        requiredConfigIdsByLob[lobKey].add(config.CONFIG_ID as long)
+    }
+
+    println "Active configurations: ${configurations.size()}"
+
+    configurations.eachWithIndex { Map config, int configIndex ->
+        String targetTable = buildQualifiedObject(
+            config.TARGET_SCHEMA,
+            config.TARGET_TABLE
+        )
+
+        File csvFolder = new File(config.CSV_FOLDER)
+
+        println ""
+        println "==============================================================="
+        println "LOB ${configIndex + 1} of ${configurations.size()}: ${config.LOB}"
+        println "CSV folder       : ${config.CSV_FOLDER}"
+        println "Target table     : ${targetTable}"
+        println "Frequency        : ${config.EXPECTED_FREQUENCY}"
+        println "==============================================================="
+
+        if (!csvFolder.exists() || !csvFolder.isDirectory()) {
+            filesFailed++
+            errors << "Missing configured folder: ${config.CSV_FOLDER}"
+            println "FAILED: configured CSV folder does not exist"
+            return
+        }
+
+        Pattern csvPattern = Pattern.compile(
+            config.CSV_FILE_REGEX,
+            Pattern.CASE_INSENSITIVE
+        )
+
+        List<File> csvFiles = (
+            csvFolder.listFiles()
+                ?.findAll { File file ->
+                    file.isFile() &&
+                    csvPattern.matcher(file.name).matches()
+                }
+        ) ?: []
+
+        List<Map> eligibleFiles = []
+
+        csvFiles.each { File csvFile ->
+            filesDiscovered++
+
+            try {
+                String encoding = config.FILE_ENCODING ?: "UTF-8"
+                char delimiter =
+                    (config.FILE_DELIMITER ?: ",").charAt(0)
+
+                Map metadata = inspectCsv(
+                    csvFile,
+                    encoding,
+                    delimiter,
+                    config.SOURCE_FILE_COLUMN,
+                    config.FILE_DATE_COLUMN
+                )
+
+                String originalName = originalContainerName(
+                    metadata.sourceFileName
+                )
+
+                String lobKey = (
+                    (config.BRAND_NAME ?: "").toString().trim().toUpperCase(Locale.ENGLISH)
+                    + "|" +
+                    (config.LOB ?: "").toString().trim().toUpperCase(Locale.ENGLISH)
+                )
+
+                String sourceFolderKey = new File(
+                    config.ORIGINAL_SOURCE_FOLDER
+                ).canonicalPath.toLowerCase(Locale.ENGLISH)
+
+                String originalGroupKey =
+                    lobKey + "|" + sourceFolderKey + "|" +
+                    originalName.toLowerCase(Locale.ENGLISH)
+
+                if (!originalGroups.containsKey(originalGroupKey)) {
+                    originalGroups[originalGroupKey] = [
+                        config                 : config,
+                        originalSourceFolder   : config.ORIGINAL_SOURCE_FOLDER,
+                        sourceFileName          : metadata.sourceFileName,
+                        auditIds                : [],
+                        csvItems                : [],
+                        requiredConfigIds       : new LinkedHashSet<Long>(
+                            requiredConfigIdsByLob[lobKey] ?: []
+                        ),
+                        successfulConfigIds     : new LinkedHashSet<Long>(),
+                        failed                  : false,
+                        originalDeleteRequested: false
+                    ]
+                }
+
+                if (isYes(config.DELETE_ORIGINAL_ON_SUCCESS)) {
+                    originalGroups[originalGroupKey].originalDeleteRequested = true
+                }
+
+                eligibleFiles << [
+                    csvFile          : csvFile,
+                    metadata         : metadata,
+                    originalGroupKey : originalGroupKey
+                ]
+
+            } catch (Exception inspectionError) {
+                unmappedInspectionFailure = true
+                long auditId = insertFileAudit(
+                    conn,
+                    fileAuditTable,
+                    fileAuditSequence,
+                    runId,
+                    config,
+                    csvFile,
+                    null,
+                    null,
+                    null,
+                    "FAILED",
+                    inspectionError.message
+                )
+                conn.commit()
+
+                filesFailed++
+                errors << "${config.LOB} | ${csvFile.name} | " +
+                    inspectionError.message
+
+                println "FAILED inspection: ${csvFile.name}"
+                println inspectionError.message
+            }
+        }
+
+        eligibleFiles.sort { Map left, Map right ->
+            int dateCompare =
+                left.metadata.fileCreationDate.time <=>
+                right.metadata.fileCreationDate.time
+
+            if (dateCompare != 0) {
+                return dateCompare
+            }
+
+            int modifiedCompare =
+                left.csvFile.lastModified() <=>
+                right.csvFile.lastModified()
+
+            return modifiedCompare != 0
+                ? modifiedCompare
+                : left.csvFile.name.compareToIgnoreCase(
+                    right.csvFile.name
+                )
+        }
+
+        println "CSV files discovered: ${csvFiles.size()}"
+        println "CSV files eligible  : ${eligibleFiles.size()}"
+
+        eligibleFiles.eachWithIndex { Map item, int fileIndex ->
+            File csvFile = item.csvFile
+            Map metadata = item.metadata
+            Map originalGroup = originalGroups[item.originalGroupKey]
+
+            println ""
+            println "---------------------------------------------------------------"
+            println "File ${fileIndex + 1} of ${eligibleFiles.size()}"
+            println "LOB                : ${config.LOB}"
+            println "CSV file           : ${csvFile.absolutePath}"
+            println "Source file name   : ${metadata.sourceFileName}"
+            println "File creation date : ${metadata.fileCreationDate}"
+            println "---------------------------------------------------------------"
+
+            long minimumAgeMillis =
+                (config.MIN_FILE_AGE_MINUTES as long) * 60L * 1000L
+
+            long fileAgeMillis =
+                System.currentTimeMillis() - csvFile.lastModified()
+
+            if (fileAgeMillis < minimumAgeMillis) {
+                long auditId = insertFileAudit(
+                    conn,
+                    fileAuditTable,
+                    fileAuditSequence,
+                    runId,
+                    config,
+                    csvFile,
+                    metadata.sourceFileName,
+                    metadata.fileCreationDate,
+                    null,
+                    "SKIPPED_NOT_STABLE",
+                    "File age is below MIN_FILE_AGE_MINUTES"
+                )
+                conn.commit()
+
+                originalGroup.auditIds << auditId
+                originalGroup.failed = true
+                filesSkipped++
+                println "SKIPPED: file is still within stability window"
+                return
+            }
+
+            String fileHash
+            try {
+                fileHash = calculateSha256(csvFile)
+            } catch (Exception hashError) {
+                long auditId = insertFileAudit(
+                    conn,
+                    fileAuditTable,
+                    fileAuditSequence,
+                    runId,
+                    config,
+                    csvFile,
+                    metadata.sourceFileName,
+                    metadata.fileCreationDate,
+                    null,
+                    "FAILED",
+                    "SHA-256 calculation failed: ${hashError.message}"
+                )
+                conn.commit()
+
+                originalGroup.auditIds << auditId
+                originalGroup.failed = true
+                filesFailed++
+                errors << "${config.LOB} | ${csvFile.name} | hash failed"
+                return
+            }
+
+            if (alreadyLoaded(
+                conn,
+                fileAuditTable,
+                config.CONFIG_ID as long,
+                fileHash,
+                metadata.sourceFileName,
+                metadata.fileCreationDate
+            )) {
+                long auditId = insertFileAudit(
+                    conn,
+                    fileAuditTable,
+                    fileAuditSequence,
+                    runId,
+                    config,
+                    csvFile,
+                    metadata.sourceFileName,
+                    metadata.fileCreationDate,
+                    fileHash,
+                    "SKIPPED_DUPLICATE",
+                    null
+                )
+                conn.commit()
+
+                originalGroup.auditIds << auditId
+                originalGroup.successfulConfigIds.add(
+                    config.CONFIG_ID as long
+                )
+                originalGroup.csvItems << [
+                    csvFile        : csvFile,
+                    auditId        : auditId,
+                    deleteRequested: isYes(config.DELETE_CSV_ON_SUCCESS)
+                ]
+                filesSkipped++
+                println "SKIPPED: identical SHA-256 was already loaded"
+
+                return
+            }
+
+            long fileAuditId = insertFileAudit(
+                conn,
+                fileAuditTable,
+                fileAuditSequence,
+                runId,
+                config,
+                csvFile,
+                metadata.sourceFileName,
+                metadata.fileCreationDate,
+                fileHash,
+                "IN_PROGRESS",
+                null
+            )
+            conn.commit()
+
+            originalGroup.auditIds << fileAuditId
+            Timestamp attemptStartTimestamp = getDatabaseTimestamp(conn)
+
+            try {
+                Map result = loadOneCsv(
+                    conn,
+                    targetTable,
+                    config,
+                    csvFile,
+                    metadata
+                )
+
+                markFileSuccess(
+                    conn,
+                    fileAuditTable,
+                    fileAuditId,
+                    result.rowsRead as long,
+                    result.rowsLoaded as long
+                )
+                conn.commit()
+
+                filesLoaded++
+                totalRowsLoaded += result.rowsLoaded as long
+                originalGroup.successfulConfigIds.add(
+                    config.CONFIG_ID as long
+                )
+                originalGroup.csvItems << [
+                    csvFile        : csvFile,
+                    auditId        : fileAuditId,
+                    deleteRequested: isYes(config.DELETE_CSV_ON_SUCCESS)
+                ]
+
+                println "SUCCESS"
+                println String.format(
+                    Locale.ENGLISH,
+                    "Rows loaded        : %,d",
+                    result.rowsLoaded
+                )
+                println String.format(
+                    Locale.ENGLISH,
+                    "Elapsed seconds    : %.2f",
+                    result.elapsedSeconds
+                )
+                println String.format(
+                    Locale.ENGLISH,
+                    "Rows per second    : %.2f",
+                    result.rowsPerSecond
+                )
+
+            } catch (CsvLoadException loadError) {
+                try { conn.rollback() } catch (Exception ignored) {}
+
+                long deletedRows = 0
+                String cleanupError = null
+
+                try {
+                    deletedRows = deleteCurrentAttemptRows(
+                        conn,
+                        targetTable,
+                        config,
+                        metadata.sourceFileName,
+                        metadata.fileCreationDate,
+                        attemptStartTimestamp
+                    )
+                    conn.commit()
+                } catch (Exception deleteError) {
+                    try { conn.rollback() } catch (Exception ignored) {}
+                    cleanupError =
+                        " Partial-row cleanup failed: ${deleteError.message}"
+                }
+
+                String failureMessage =
+                    loadError.message +
+                    "; attempted_rows=${loadError.rowsAttempted}" +
+                    "; cleaned_target_rows=${deletedRows}" +
+                    (cleanupError ?: "")
+
+                markFileFailed(
+                    conn,
+                    fileAuditTable,
+                    fileAuditId,
+                    loadError.rowsRead,
+                    failureMessage
+                )
+                conn.commit()
+
+                originalGroup.failed = true
+                filesFailed++
+                errors << "${config.LOB} | ${csvFile.name} | " +
+                    failureMessage
+
+                println "FAILED"
+                println failureMessage
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // COMPLETENESS BARRIER + CSV/ORIGINAL SOURCE CLEANUP
+    // -------------------------------------------------------------------------
+    originalGroups.each { String groupKey, Map group ->
+        Set<Long> missingConfigIds = new LinkedHashSet<Long>(
+            group.requiredConfigIds as Collection<Long>
+        )
+        missingConfigIds.removeAll(
+            group.successfulConfigIds as Collection<Long>
+        )
+
+        boolean groupComplete =
+            !unmappedInspectionFailure &&
+            !group.failed &&
+            missingConfigIds.isEmpty()
+
+        if (!groupComplete) {
+            String reason
+            if (unmappedInspectionFailure) {
+                reason = "A CSV inspection failure could not be mapped safely to an original source"
+            } else if (group.failed) {
+                reason = "At least one related Forecast/BOM Usage CSV failed or was not stable"
+            } else {
+                reason = "Required configurations were not completed: " +
+                    missingConfigIds.join(",")
+            }
+
+            updateCleanupStatus(
+                conn,
+                fileAuditTable,
+                group.auditIds as List<Long>,
+                "RETAINED_DUE_TO_INCOMPLETE_GROUP",
+                "RETAINED_DUE_TO_FAILURE",
+                reason
+            )
+            conn.commit()
+
+            println "Cleanup retained for source: " +
+                originalContainerName(group.sourceFileName) +
+                " | " + reason
+            return
+        }
+
+        // Delete converted CSVs only after both Forecast and BOM Usage have
+        // loaded (or were verified duplicates) for this original source.
+        boolean csvCleanupFailed = false
+        group.csvItems.each { Map csvItem ->
+            if (!csvItem.deleteRequested) {
+                return
+            }
+
+            File csvFile = csvItem.csvFile as File
+            boolean deleted = csvFile.delete()
+
+            updateCleanupStatus(
+                conn,
+                fileAuditTable,
+                [csvItem.auditId as Long],
+                deleted ? "DELETED" : "DELETE_FAILED",
+                null,
+                deleted
+                    ? null
+                    : "CSV could not be deleted after Forecast/BOM completeness check"
+            )
+            conn.commit()
+
+            if (!deleted) {
+                csvCleanupFailed = true
+                cleanupFailures++
+                errors << "CSV delete failed: ${csvFile.absolutePath}"
+            }
+        }
+
+        if (csvCleanupFailed) {
+            updateCleanupStatus(
+                conn,
+                fileAuditTable,
+                group.auditIds as List<Long>,
+                null,
+                "RETAINED_DUE_TO_CSV_DELETE_FAILURE",
+                "Original retained because at least one related CSV could not be deleted"
+            )
+            conn.commit()
+            return
+        }
+
+        if (!group.originalDeleteRequested) {
+            return
+        }
+
+        File originalFile = findOriginalSourceFile(
+            group.originalSourceFolder,
+            group.sourceFileName
+        )
+
+        if (originalFile == null) {
+            String expectedOriginalName = originalContainerName(
+                group.sourceFileName
+            )
+            File configuredFolder = new File(
+                group.originalSourceFolder ?: ""
+            )
+            String cleanupMessage =
+                "No exact original source file was found for cleanup" +
+                "; configured_folder=" + group.originalSourceFolder +
+                "; folder_exists=" + configuredFolder.isDirectory() +
+                "; expected_file=" + expectedOriginalName
+
+            updateCleanupStatus(
+                conn,
+                fileAuditTable,
+                group.auditIds as List<Long>,
+                null,
+                "NOT_FOUND",
+                cleanupMessage
+            )
+            conn.commit()
+            println cleanupMessage
+            cleanupFailures++
+            errors << cleanupMessage
+            return
+        }
+
+        boolean deleted = originalFile.delete()
+
+        updateCleanupStatus(
+            conn,
+            fileAuditTable,
+            group.auditIds as List<Long>,
+            null,
+            deleted ? "DELETED" : "DELETE_FAILED",
+            deleted
+                ? null
+                : "Original source could not be deleted: " +
+                  originalFile.absolutePath
+        )
+        conn.commit()
+
+        if (!deleted) {
+            cleanupFailures++
+            errors << "Original delete failed: ${originalFile.absolutePath}"
+        }
+    }
+
+    println ""
+    println "==============================================================="
+    println "NIKE PRODUCTION BLOB INGESTION COMPLETED"
+    println "RUN_ID             : ${runId}"
+    println "FILES DISCOVERED   : ${filesDiscovered}"
+    println "FILES LOADED       : ${filesLoaded}"
+    println "FILES SKIPPED      : ${filesSkipped}"
+    println "FILES FAILED       : ${filesFailed}"
+    println "CLEANUP FAILURES   : ${cleanupFailures}"
+    println String.format(
+        Locale.ENGLISH,
+        "TOTAL ROWS LOADED  : %,d",
+        totalRowsLoaded
+    )
+    println "==============================================================="
+
+    if (filesFailed > 0 || cleanupFailures > 0) {
+        throw new RuntimeException(
+            "Nike ingestion completed with failures. " +
+            "file_failures=${filesFailed}; " +
+            "cleanup_failures=${cleanupFailures}; " +
+            errors.join(" | ")
+        )
+    }
+
+} finally {
+    if (originalAutoCommit) {
+        try {
+            conn.setAutoCommit(true)
+        } catch (Exception ignored) {}
+    }
+}
+
+boolean isBomUsageConfig(Map config) {
+    String fileType = config.FILE_TYPE?.toString()?.trim()?.toUpperCase(Locale.ENGLISH) ?: ""
+    String csvFolder = config.CSV_FOLDER?.toString()?.replace("\\", "/")?.toLowerCase(Locale.ENGLISH) ?: ""
+
+    return fileType.contains("BOM") || csvFolder.contains("/bom_usage/")
+}
+
+String normalizedLobToken(Object value) {
+    return (value ?: "")
+        .toString()
+        .trim()
+        .toUpperCase(Locale.ENGLISH)
+        .replaceAll(/[^A-Z0-9]/, "")
+}
+
+String canonicalFileType(Object value) {
+    String text = (value ?: "").toString().trim()
+    String token = text
+        .toUpperCase(Locale.ENGLISH)
+        .replaceAll(/[^A-Z0-9]/, "")
+
+    return token == "BOMUSAGE" ? "BOM Usage" : text
+}
