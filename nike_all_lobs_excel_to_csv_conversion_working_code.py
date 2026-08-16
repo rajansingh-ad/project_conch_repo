@@ -25,7 +25,7 @@ from collections import OrderedDict
 from openpyxl import load_workbook
 
 
-DEFAULT_INPUT_BASE = "/mnt/fss-rodn-iad-odi-fs/project_conch/nike"
+DEFAULT_INPUT_BASE = "/mnt/fss-rodn-iad-odi-fs/project_conch/nike/gdrive_to_sftp_automation"
 DEFAULT_OUTPUT_BASE = "/mnt/fss-rodn-iad-odi-fs/project_conch/nike/file_conversion_to_csv"
 
 INPUT_BASE = os.environ.get("NIKE_INPUT_BASE", DEFAULT_INPUT_BASE).strip()
